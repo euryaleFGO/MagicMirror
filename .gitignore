@@ -1,0 +1,28 @@
+.env
+.venv/
+env/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 模型与音频大文件
+Model/**
+!Model/.gitkeep
+audio/**/*.wav
+
+# 运行时生成文件
+*.log
+*.tmp
+*.bak
+
+

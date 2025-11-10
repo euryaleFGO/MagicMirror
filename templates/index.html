@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MagicMirror</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <!-- 权限请求弹窗 -->
+    <div class="permission-modal" id="permissionModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>需要麦克风权限</h2>
+            </div>
+            <div class="modal-body">
+                <p>为了使用语音识别功能，我们需要访问您的麦克风。</p>
+                <p>请点击"允许"按钮授予权限。</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-cancel" id="cancelBtn">取消</button>
+                <button class="btn-allow" id="allowBtn">允许</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 球体容器 -->
+    <div class="ball-container">
+        <div class="ball" id="ball">
+            <div class="inner-glow"></div>
+            <div class="color-overlay"></div>
+        </div>
+    </div>
+    
+    <!-- 全屏波形容器 -->
+    <div class="waveform-container" id="waveformContainer">
+        <canvas id="waveformCanvas" class="waveform-canvas"></canvas>
+    </div>
+    <div class="loader">
+        <span class="loader-text" id="loaderText">您今天想聊什么？</span>
+    </div>
+    
+    <!-- 聊天记录容器 -->
+    <div class="chat-container" id="chatContainer" style="display: none;">
+        <div class="chat-messages" id="chatMessages"></div>
+    </div>
+    
+    <!-- 文字输入区域 -->
+    <div class="text-input-container">
+        <div class="input-wrapper">
+            <input 
+                type="text" 
+                id="textInput" 
+                class="text-input" 
+                placeholder="或者直接输入文字..."
+                autocomplete="off"
+            >
+            <button id="sendBtn" class="send-btn" title="发送">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="22" y1="2" x2="11" y2="13"></line>
+                    <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                </svg>
+            </button>
+        </div>
+    </div>
+    
+    <script src="{{ url_for('static', filename='js/script.js') }}"></script>
+</body>
+</html>
+
