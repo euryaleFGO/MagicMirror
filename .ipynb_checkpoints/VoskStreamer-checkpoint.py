@@ -1,12 +1,8 @@
-import os
 from vosk import Model, KaldiRecognizer
 import pyaudio  # 用于获取麦克风输入
-from config import VOSK_MODEL_PATH
 
 # 加载模型（替换为你的模型路径）
-if not os.path.isdir(VOSK_MODEL_PATH):
-    raise FileNotFoundError(f"Vosk模型路径不存在：{VOSK_MODEL_PATH}")
-model = Model(VOSK_MODEL_PATH)
+model = Model(r"Model/vosk-model-small-cn-0.22")
 
 # 配置音频参数（需与模型兼容，16000Hz单声道是Vosk常用配置）
 sample_rate = 16000  # 采样率

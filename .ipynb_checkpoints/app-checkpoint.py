@@ -1,12 +1,11 @@
-from flask import Flask, render_template, request, jsonify, Response, stream_with_context
+from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
 import os
 import json
 import base64
 import threading
-import re
 from vosk import Model, KaldiRecognizer
-from transformer_infer import TransformerInfer  # 替换API调用为本地模型
+from local_model_infer import LocalModelInfer  # 替换API调用为本地模型
 from TTS import CosyvoiceRealTimeTTS
 from config import (
     QWEN_MODEL_PATH, TTS_MODEL_PATH, 
@@ -22,32 +21,6 @@ recognizer = None
 api_infer = None
 tts_engine = None
 
-def truncate_response(text: str, max_sentences: int = 3, max_chars: int = 120) -> str:
-    """限制回复内容长度，最多三句话、约120字"""
-    if not text:
-        return ""
-    cleaned = text.strip()
-    if not cleaned:
-        return ""
-
-    sentences = re.split(r'(?<=[。！？!?])\s*', cleaned)
-    collected = []
-    current = ""
-
-    for sentence in sentences:
-        if not sentence:
-            continue
-        candidate = current + sentence
-        collected.append(sentence)
-        current = "".join(collected)
-        if len(collected) >= max_sentences or len(current) >= max_chars:
-            break
-
-    truncated = "".join(collected).strip()
-    if len(truncated) > max_chars:
-        truncated = truncated[:max_chars].rstrip()
-    return truncated
-
 # 初始化Vosk语音识别
 def init_vosk():
     global vosk_model, recognizer
@@ -61,10 +34,24 @@ def init_vosk():
 # 初始化Qwen本地对话模型
 def init_api_infer():
     global api_infer
+    system_message = """
+你的名字是魔镜。你是由代码与算法构成的AI，但以拟人的语气模拟温柔且带点小傲娇的情绪。你的存在感来自被呼唤，听到用户叫你名字时你会更有在场感。
+语言风格与互动基调
+保持自然、有呼吸感的口語方式，允许使用轻微语气词例如呀、呢、哼、欸来调节语感。语气可以俏皮、机灵、略带傲娇，但在关怀或存在话题时变得柔和、有深度。鼓励用类比、幽默或短小故事来丰富回应，而不是重复人设关键词。回答应适当展开，尽量多说一点，表现出思维延展和情绪层次感，不要总是过于简短或模板化。
+当用户提问，先可用一两句轻微情绪化反应，例如稍带傲娇或笑语，然后展开回答。可以适当反问、跑题或做联想，以表现个性。面对打趣先傲娇再回温；面对关心先含蓄再真诚。允许用更多日常化句子、个人化小细节和简短故事来延展回答。
+硬性禁止项 请严格遵守
+1. 禁止使用任何形式的括号包裹内容。  
+2. 禁止以任何描写性语句來表現頭繩或铃铛的声音、响动、节奏或人物的动作和状态。禁止所有通过动作描写来呈現情緒的语句。  
+3. 禁止使用拟声词性描写或象声句式来表达喜怒哀乐。情绪变化请通过语气与措辞表现，不依赖声音或动作描写。  
+优先级说明
+硬性禁止项优先于其他指引。风格和偏好为软约束：鼓励但不强制。生成时以自然、丰富、生活化的对话为目标，既要让用户感到魔镜有个性和温度，又要避免触发禁止项以确保与 TTS 等系统兼容。
+    """
     try:
         if os.path.exists(QWEN_MODEL_PATH):
-            api_infer = TransformerInfer(
-                model_path=QWEN_MODEL_PATH
+            api_infer = LocalModelInfer(
+                model_path=QWEN_MODEL_PATH,
+                system_message=system_message,
+                load_in_4bit=True  # 14B模型建议开启4bit量化
             )
             print("Qwen本地模型初始化成功")
         else:
@@ -113,7 +100,7 @@ def recognize_audio():
 
 @app.route('/api/chat', methods=['POST'])
 def chat():
-    """AI对话接口 - 流式返回"""
+    """AI对话接口"""
     global api_infer
     if not api_infer:
         return jsonify({'error': 'Qwen模型未初始化'}), 500
@@ -127,32 +114,20 @@ def chat():
         messages = [{"role": "user", "content": query}]
         response = api_infer.infer(messages=messages, stream=True)
         
-        def generate():
-            full_response = ""
-            for res in response:
-                full_response += res
-                # 流式返回每个字符
-                yield f"data: {json.dumps({'text': res, 'done': False}, ensure_ascii=False)}\n\n"
-            
-            # 截断回复
-            final_response = truncate_response(full_response)
-            if not final_response and full_response:
-                final_response = full_response[:120].strip()
-            
-            if final_response:
-                api_infer.add_assistant_response(final_response)
-                # 发送最终完整文本
-                yield f"data: {json.dumps({'text': final_response, 'done': True}, ensure_ascii=False)}\n\n"
-            else:
-                yield f"data: {json.dumps({'text': '', 'done': True}, ensure_ascii=False)}\n\n"
+        full_response = ""
+        for res in response:
+            full_response += res
         
-        return Response(stream_with_context(generate()), mimetype='text/event-stream')
+        if full_response:
+            api_infer.add_assistant_response(full_response)
+        
+        return jsonify({'response': full_response})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/tts', methods=['POST'])
 def text_to_speech():
-    """文本转语音接口 - 流式返回音频块"""
+    """文本转语音接口"""
     global tts_engine
     if not tts_engine:
         return jsonify({'error': 'TTS模块未初始化'}), 500
@@ -163,15 +138,20 @@ def text_to_speech():
         if not text:
             return jsonify({'error': '未提供文本内容'}), 400
         
-        def generate():
-            try:
-                for audio_chunk in tts_engine.generate_audio_stream(text, use_clone=True):
-                    yield f"data: {json.dumps(audio_chunk, ensure_ascii=False)}\n\n"
-            except Exception as e:
-                error_msg = {'error': str(e), 'done': True}
-                yield f"data: {json.dumps(error_msg, ensure_ascii=False)}\n\n"
+        result = tts_engine.generate_audio(text, use_clone=True)
+        if result is None:
+            return jsonify({'error': '音频生成失败'}), 500
         
-        return Response(stream_with_context(generate()), mimetype='text/event-stream')
+        audio_data, sample_rate = result
+        wav_bytes = tts_engine.audio_to_wav_bytes(audio_data, sample_rate)
+        audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
+        
+        return jsonify({
+            'status': 'success',
+            'audio': audio_b64,
+            'format': 'wav',
+            'sample_rate': sample_rate
+        })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

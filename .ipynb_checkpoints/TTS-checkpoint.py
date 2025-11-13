@@ -7,18 +7,13 @@ import sys
 import re
 import time
 import gc
-import base64
 import numpy as np
 import sounddevice as sd
 import torch
 import wave
 import io
 from queue import Queue, Empty
-from threading import Thread, Lock
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# 项目根目录
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+from threading import Thread
 
 # ---------- 淡入淡出 ----------
 def fade_in_out(audio: np.ndarray, sr: int, fade_duration: float = 0.01) -> np.ndarray:
@@ -33,14 +28,11 @@ def fade_in_out(audio: np.ndarray, sr: int, fade_duration: float = 0.01) -> np.n
     return audio
 
 # ----------  CosyVoice  ----------
-COSYVOICE_ROOT = os.path.join(BASE_DIR, "Cosyvoice")
+COSYVOICE_ROOT = r"./CosyVoice"  # 根据实际路径修改
 MATCHA_TTS_PATH = os.path.join(COSYVOICE_ROOT, "third_party", "Matcha-TTS")
 for p in [COSYVOICE_ROOT, MATCHA_TTS_PATH]:
-    if os.path.isdir(p):
-        if p not in sys.path:
-            sys.path.append(p)
-    else:
-        print(f"[WARN] CosyVoice 路径不存在：{p}")
+    if p not in sys.path:
+        sys.path.append(p)
 
 # 延迟导入 CosyVoice2，避免模块加载时出错
 # from cosyvoice.cli.cosyvoice import CosyVoice2
@@ -67,7 +59,6 @@ class CosyvoiceRealTimeTTS:
         # ---- 音色缓存 ----
         self._prompt_semantic = None
         self._spk_emb = None
-        self._cache_lock = Lock()  # 保护音色缓存的锁
         # ------------------
 
         self.sample_text = "这是一段测试语音，喂喂喂，你们听得到吗？让我看看啊别急"
@@ -85,53 +76,23 @@ class CosyvoiceRealTimeTTS:
         text = text.strip()
         if not text:
             return []
-        # 减小最大字符数，让块更小
-        MAX_CHARS = 40
-        # 优先按感叹号、句号、逗号切分
-        # 使用正则表达式按标点符号切分，保留标点符号
-        # 匹配标点符号：。！？，,
-        pattern = r'([。！？，,])'
-        parts = re.split(pattern, text)
-        
-        segs = []
-        current_seg = ""
-        
-        for part in parts:
-            if not part:
+        MAX_CHARS = 80
+        parts = re.split(r'([。！？]\s*)', text)
+        segs, buf = [], ""
+        for p in parts:
+            if not p.strip():
                 continue
-            
-            # 如果当前片段是标点符号
-            if re.match(r'^[。！？，,]$', part):
-                current_seg += part
-                # 遇到标点符号就切分（优先切分）
-                if current_seg.strip():
-                    segs.append(current_seg.strip())
-                    current_seg = ""
-            else:
-                current_seg += part
-                # 如果超过最大长度，尝试在标点符号处切分
-                if len(current_seg) > MAX_CHARS:
-                    # 从后往前找标点符号
-                    match = None
-                    for i in range(len(current_seg) - 1, max(0, len(current_seg) - MAX_CHARS), -1):
-                        if current_seg[i] in '。！？，,':
-                            match = i + 1
-                            break
-                    
-                    if match:
-                        segs.append(current_seg[:match].strip())
-                        current_seg = current_seg[match:]
-                    else:
-                        # 没有找到标点符号，按最大长度切分
-                        segs.append(current_seg[:MAX_CHARS].strip())
-                        current_seg = current_seg[MAX_CHARS:]
-        
-        # 添加剩余文本
-        if current_seg.strip():
-            segs.append(current_seg.strip())
-        
+            if len(buf) + len(p) > MAX_CHARS and buf:
+                segs.append(buf.strip())
+                buf = ""
+            buf += p
+            while len(buf) > MAX_CHARS:
+                segs.append(buf[:MAX_CHARS])
+                buf = buf[MAX_CHARS:]
+        if buf.strip():
+            segs.append(buf.strip())
         # 过滤纯标点/空白
-        segs = [s for s in segs if s.strip() and re.search(r'[\u4e00-\u9fa5a-zA-Z0-9]', s)]
+        segs = [s for s in segs if re.search(r'\w', s, flags=re.UNICODE)]
         return segs
 
     # ------------ 播放线程 ------------
@@ -387,122 +348,6 @@ class CosyvoiceRealTimeTTS:
         
         wav_buffer.seek(0)
         return wav_buffer.read()
-
-    # ------------ 单个音频段生成函数（用于并行处理）------------
-    def _generate_single_segment(self, seg: str, idx: int, total: int, use_clone: bool):
-        """生成单个文本段的音频"""
-        if not re.search(r'\w', seg, flags=re.UNICODE):
-            print(f"【跳过】段 {idx} 无有效文字")
-            return None
-        
-        print(f"【合成】{idx}/{total}：{seg[:30]}...")
-        results = None
-        
-        try:
-            # 1）生成
-            if use_clone and self._prompt_semantic is not None:
-                results = self.cosyvoice.inference(
-                    seg, prompt_semantic=self._prompt_semantic,
-                    spk_emb=self._spk_emb, stream=False)
-            else:
-                results = self.cosyvoice.inference_zero_shot(
-                    seg, self.sample_text, self.ref_wav, stream=False)
-
-            results = list(results)
-
-            # 2）缓存音色（第一次，需要线程安全处理）
-            if use_clone:
-                with self._cache_lock:
-                    if self._prompt_semantic is None:
-                        first = results[0]
-                        self._prompt_semantic = first.get("prompt_semantic")
-                        self._spk_emb = first.get("spk_emb")
-
-            # 3）处理音频
-            audio_result = results[0]
-            audio = audio_result['tts_speech'].squeeze().cpu().numpy().astype(np.float32)
-            if np.max(np.abs(audio)) > 0:
-                audio /= np.max(np.abs(audio))
-            audio = fade_in_out(audio, self.sample_rate, self.fade_dur)
-            
-            dur = len(audio) / self.sample_rate
-            print(f"【合成】片段 {idx} 完成，时长 {dur:.2f}s")
-            
-            # 转换为WAV字节流
-            wav_bytes = self.audio_to_wav_bytes(audio, self.sample_rate)
-            return {
-                'audio': base64.b64encode(wav_bytes).decode('utf-8'),
-                'text': seg,
-                'index': idx,
-                'total': total,
-                'done': idx == total
-            }
-
-        except Exception as e:
-            print(f"【合成】段 {idx} 失败：{repr(e)}")
-            return None
-
-        finally:
-            if results is not None:
-                del results
-            gc.collect()
-            torch.cuda.empty_cache()
-
-    # ------------ 流式生成音频块（并行生成，顺序推送）------------
-    def generate_audio_stream(self, text: str, use_clone=True, max_workers=3):
-        """并行生成音频块，但按顺序yield推送"""
-        text = text.strip()
-        if not text:
-            print("[提示] 输入文本为空")
-            return
-        
-        if use_clone and self.ref_wav is None:
-            print("[WARN] 无参考语音，自动使用默认音色")
-            use_clone = False
-        
-        try:
-            segments = self.split_text_by_punctuation(text)
-            if not segments:
-                print("[提示] 没有有效可合成文本")
-                return
-            
-            total_segments = len(segments)
-            print(f"文本已切分为 {total_segments} 段，开始并行生成（最大并发数：{max_workers}）")
-            
-            # 使用线程池并行生成
-            results_dict = {}  # 存储结果，key为索引
-            next_index = 1  # 下一个要推送的索引
-            
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # 提交所有任务
-                future_to_index = {}
-                for idx, seg in enumerate(segments, 1):
-                    future = executor.submit(self._generate_single_segment, seg, idx, total_segments, use_clone)
-                    future_to_index[future] = idx
-                
-                # 按完成顺序收集结果，但按索引顺序推送
-                for future in as_completed(future_to_index):
-                    idx = future_to_index[future]
-                    try:
-                        result = future.result()
-                        if result is not None:
-                            results_dict[idx] = result
-                            
-                            # 按顺序推送：如果当前完成的正好是下一个要推送的，就推送
-                            while next_index in results_dict:
-                                yield results_dict.pop(next_index)
-                                next_index += 1
-                    except Exception as e:
-                        print(f"【错误】段 {idx} 生成异常：{repr(e)}")
-                        # 即使失败也要继续推送后续的
-                        next_index += 1
-                        while next_index in results_dict:
-                            yield results_dict.pop(next_index)
-                            next_index += 1
-                    
-        except Exception as e:
-            print(f"❌ 流式生成错误：{e}")
-            return
 
 
 # -------------------- CLI测试 --------------------

@@ -679,6 +679,10 @@ async function sendToAI(query) {
         
         showThinkingMessage();
         
+        let fullResponse = '';
+        let botMessageDiv = null;
+        
+        // 使用fetch接收流式数据
         const response = await fetch('/api/chat', {
             method: 'POST',
             headers: {
@@ -687,22 +691,69 @@ async function sendToAI(query) {
             body: JSON.stringify({ query: query })
         });
         
-        const result = await response.json();
-        
-        if (result.response) {
-            console.log('AI回复:', result.response);
-            
-            // 保存完整文本
-            currentText = result.response;
-            displayText = '';
-            
-            // 清理思考动画，保留占位气泡
-            clearThinkingMessage({ preserve: true });
-            
-            // 发送TTS请求
-            await textToSpeech(result.response);
+        if (!response.ok) {
+            throw new Error('请求失败');
         }
-        else {
+        
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop(); // 保留最后一个不完整的行
+            
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    try {
+                        const data = JSON.parse(line.slice(6));
+                        if (data.text) {
+                            fullResponse += data.text;
+                            
+                            // 清理思考动画，创建机器人消息
+                            if (!botMessageDiv) {
+                                clearThinkingMessage({ preserve: true });
+                                botMessageDiv = addMessageToChat('', false);
+                            }
+                            
+                            // 实时更新机器人消息
+                            if (botMessageDiv) {
+                                const bubble = botMessageDiv.querySelector('.message-bubble');
+                                if (bubble) {
+                                    bubble.textContent = fullResponse;
+                                    if (chatContainer) {
+                                        chatContainer.scrollTop = chatContainer.scrollHeight;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        if (data.done) {
+                            // 保存完整文本
+                            currentText = fullResponse;
+                            displayText = '';
+                            
+                            // 发送TTS请求
+                            await textToSpeech(fullResponse);
+                            return;
+                        }
+                    } catch (e) {
+                        console.error('解析流式数据失败:', e);
+                    }
+                }
+            }
+        }
+        
+        // 如果没有收到done信号，使用已接收的文本
+        if (fullResponse) {
+            currentText = fullResponse;
+            displayText = '';
+            await textToSpeech(fullResponse);
+        } else {
             clearThinkingMessage();
             addMessageToChat('抱歉，我暂时没有获取到回复。', false);
             setState(STATE.IDLE);
@@ -717,9 +768,33 @@ async function sendToAI(query) {
     }
 }
 
-// 文本转语音（流式字幕）
+// 文本转语音（流式字幕和流式音频）
 async function textToSpeech(text) {
     try {
+        // 保存文本用于流式显示
+        currentText = text;
+        displayText = '';
+        
+        // 确保canvas已初始化
+        if (!waveformCanvas || !waveformCtx) {
+            console.warn('波形canvas未初始化，尝试重新初始化');
+            setupCanvas();
+            if (waveformCanvas) {
+                waveformCtx = waveformCanvas.getContext('2d');
+            }
+        }
+        
+        // 执行动画序列：球体 → 线 → 波形
+        await animateBallToWaveform();
+        
+        // 动画完成后开始绘制波形
+        drawWaveform();
+        
+        // 不再使用旧的流式字幕函数，改为与音频块同步显示
+        
+        isPlayingAudio = true;
+        
+        // 使用fetch接收流式音频
         const response = await fetch('/api/tts', {
             method: 'POST',
             headers: {
@@ -728,77 +803,123 @@ async function textToSpeech(text) {
             body: JSON.stringify({ text: text })
         });
         
-        const result = await response.json();
-        console.log('TTS状态:', result);
+        if (!response.ok) {
+            throw new Error('TTS请求失败');
+        }
         
-        // 开始播放音频时切换状态
-        if (result.status === 'success' && result.audio) {
-            isPlayingAudio = true;
-            
-            // 保存文本用于流式显示
-            currentText = text;
-            displayText = '';
-            
-            // 确保canvas已初始化
-            if (!waveformCanvas || !waveformCtx) {
-                console.warn('波形canvas未初始化，尝试重新初始化');
-                setupCanvas();
-                if (waveformCanvas) {
-                    waveformCtx = waveformCanvas.getContext('2d');
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let audioChunks = [];
+        let currentAudioIndex = 0;
+        let isPlaying = false;
+        
+        // 累积已显示的文本
+        let displayedText = '';
+        
+        // 播放音频块的函数
+        const playNextChunk = () => {
+            if (currentAudioIndex < audioChunks.length && !isPlaying) {
+                isPlaying = true;
+                const chunk = audioChunks[currentAudioIndex];
+                const audioUrl = `data:audio/wav;base64,${chunk.audio}`;
+                const audio = new Audio(audioUrl);
+                
+                // 更新字幕显示对应的文本段
+                if (chunk.text) {
+                    displayedText += chunk.text;
+                    updateBotMessage(displayedText);
+                }
+                
+                audio.onended = () => {
+                    currentAudioIndex++;
+                    isPlaying = false;
+                    // 继续播放下一个块
+                    if (currentAudioIndex < audioChunks.length) {
+                        playNextChunk();
+                    } else {
+                        // 所有音频块播放完成
+                        finishSpeaking();
+                    }
+                };
+                
+                audio.onerror = async (error) => {
+                    console.error('音频播放失败:', error);
+                    isPlaying = false;
+                    currentAudioIndex++;
+                    if (currentAudioIndex < audioChunks.length) {
+                        playNextChunk();
+                    } else {
+                        await finishSpeaking();
+                    }
+                };
+                
+                audio.play().catch(async (error) => {
+                    console.error('播放音频失败:', error);
+                    isPlaying = false;
+                    currentAudioIndex++;
+                    if (currentAudioIndex < audioChunks.length) {
+                        playNextChunk();
+                    } else {
+                        await finishSpeaking();
+                    }
+                });
+            }
+        };
+        
+        // 读取流式数据
+        let allChunksReceived = false;
+        
+        // 异步读取流式数据
+        (async () => {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) {
+                    allChunksReceived = true;
+                    break;
+                }
+                
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop(); // 保留最后一个不完整的行
+                
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        try {
+                            const data = JSON.parse(line.slice(6));
+                            if (data.audio) {
+                                audioChunks.push(data);
+                                // 如果是第一个音频块，立即开始播放
+                                if (audioChunks.length === 1) {
+                                    playNextChunk();
+                                } else if (!isPlaying && currentAudioIndex < audioChunks.length) {
+                                    // 如果当前没有在播放，且还有未播放的块，继续播放
+                                    playNextChunk();
+                                }
+                            }
+                            
+                            if (data.error) {
+                                console.error('TTS错误:', data.error);
+                                await finishSpeaking();
+                                return;
+                            }
+                            
+                            if (data.done) {
+                                allChunksReceived = true;
+                            }
+                        } catch (e) {
+                            console.error('解析流式数据失败:', e);
+                        }
+                    }
                 }
             }
             
-            // 执行动画序列：球体 → 线 → 波形
-            await animateBallToWaveform();
-            
-            // 动画完成后开始绘制波形和播放音频
-            drawWaveform();
-            startStreamingSubtitle(text);
-            
-            // 解码base64音频数据
-            const audioData = atob(result.audio);
-            const audioArray = new Uint8Array(audioData.length);
-            for (let i = 0; i < audioData.length; i++) {
-                audioArray[i] = audioData.charCodeAt(i);
+            // 所有块接收完毕，如果还有未播放的块，继续播放
+            if (!isPlaying && currentAudioIndex < audioChunks.length) {
+                playNextChunk();
             }
-            
-            // 创建音频Blob
-            const audioBlob = new Blob([audioArray], { type: 'audio/wav' });
-            const audioUrl = URL.createObjectURL(audioBlob);
-            
-            // 创建Audio对象并播放
-            if (audioPlayer) {
-                audioPlayer.pause();
-                audioPlayer = null;
-            }
-            
-            audioPlayer = new Audio(audioUrl);
-            
-            // 播放完成时清理
-            audioPlayer.onended = async () => {
-                URL.revokeObjectURL(audioUrl);
-                await finishSpeaking();
-            };
-            
-            // 播放错误处理
-            audioPlayer.onerror = async (error) => {
-                console.error('音频播放失败:', error);
-                URL.revokeObjectURL(audioUrl);
-                await finishSpeaking();
-            };
-            
-            // 开始播放
-            audioPlayer.play().catch(async (error) => {
-                console.error('播放音频失败:', error);
-                URL.revokeObjectURL(audioUrl);
-                await finishSpeaking();
-            });
-        } else {
-            console.error('TTS返回数据格式错误:', result);
-            updateBotMessage(text);
-            setState(STATE.IDLE);
-            updateSubtitle('您今天想聊什么？');
-        }
+        })();
+        
     } catch (error) {
         console.error('TTS失败:', error);
         updateBotMessage(text);
