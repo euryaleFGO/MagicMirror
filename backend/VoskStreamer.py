@@ -1,8 +1,11 @@
 from vosk import Model, KaldiRecognizer
 import pyaudio  # 用于获取麦克风输入
+import os
 
+# 获取当前文件所在目录（backend目录）
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 加载模型（替换为你的模型路径）
-model = Model(r"Model\vosk-model-small-cn-0.22")
+model = Model(os.path.join(BASE_DIR, "Model", "vosk-model-small-cn-0.22"))
 
 # 配置音频参数（需与模型兼容，16000Hz单声道是Vosk常用配置）
 sample_rate = 16000  # 采样率

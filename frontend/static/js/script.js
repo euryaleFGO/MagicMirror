@@ -26,6 +26,9 @@ let microphonePermissionGranted = false;
 let chatContainer = null;
 let chatMessages = null;
 let thinkingMessage = null;
+let currentConversationId = null;  // 当前对话ID
+let sidebar = null;
+let conversationsList = null;
 
 // 设置状态
 function setState(state) {
@@ -684,13 +687,23 @@ async function sendToAI(query) {
             headers: {
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify({ query: query })
+            body: JSON.stringify({ 
+                query: query,
+                conversation_id: currentConversationId  // 传递当前对话ID
+            })
         });
         
         const result = await response.json();
         
         if (result.response) {
             console.log('AI回复:', result.response);
+            
+            // 更新当前对话ID
+            if (result.conversation_id) {
+                currentConversationId = result.conversation_id;
+                // 刷新对话列表
+                await loadConversations();
+            }
             
             // 保存完整文本
             currentText = result.response;
@@ -998,6 +1011,60 @@ function initTextInput() {
     console.log('文字输入功能已初始化');
 }
 
+// 初始化清空历史按钮
+function initClearHistoryBtn() {
+    const clearHistoryBtn = document.getElementById('clearHistoryBtn');
+    
+    if (!clearHistoryBtn) {
+        console.error('清空历史按钮未找到');
+        return;
+    }
+    
+    clearHistoryBtn.addEventListener('click', async () => {
+        // 确认对话框
+        if (!confirm('确定要清空当前对话的历史吗？')) {
+            return;
+        }
+        
+        try {
+            // 调用后端API清空历史
+            const response = await fetch('/api/clear_history', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    conversation_id: currentConversationId
+                })
+            });
+            
+            const result = await response.json();
+            
+            if (result.status === 'success') {
+                // 清空前端聊天记录
+                if (chatMessages) {
+                    chatMessages.innerHTML = '';
+                }
+                // 隐藏聊天容器
+                if (chatContainer) {
+                    chatContainer.style.display = 'none';
+                }
+                // 刷新对话列表
+                await loadConversations();
+                console.log('对话历史已清空');
+            } else {
+                console.error('清空历史失败:', result.error);
+                alert('清空历史失败，请稍后重试');
+            }
+        } catch (error) {
+            console.error('清空历史请求失败:', error);
+            alert('清空历史失败，请稍后重试');
+        }
+    });
+    
+    console.log('清空历史按钮已初始化');
+}
+
 // 页面加载时初始化
 window.addEventListener('DOMContentLoaded', () => {
     console.log('DOM加载完成，初始化元素...');
@@ -1034,6 +1101,12 @@ window.addEventListener('DOMContentLoaded', () => {
     // 初始化文字输入功能
     initTextInput();
     
+    // 初始化清空历史按钮
+    initClearHistoryBtn();
+    
+    // 初始化侧边栏
+    initSidebar();
+    
     // 开始颜色动画
     updateColor();
     
@@ -1043,6 +1116,293 @@ window.addEventListener('DOMContentLoaded', () => {
 // 页面完全加载后
 window.addEventListener('load', async () => {
     console.log('页面加载完成');
+    // 加载对话列表
+    await loadConversations();
+    // 加载对话历史
+    await loadChatHistory();
 });
+
+// 加载对话历史
+async function loadChatHistory(conversationId = null) {
+    try {
+        const url = conversationId 
+            ? `/api/load_history?conversation_id=${conversationId}`
+            : '/api/load_history';
+        const response = await fetch(url);
+        const result = await response.json();
+        
+        // 更新当前对话ID
+        if (result.conversation_id) {
+            currentConversationId = result.conversation_id;
+        }
+        
+        if (result.messages && result.messages.length > 0) {
+            // 显示聊天容器
+            showChatContainer();
+            
+            // 清空现有消息
+            if (chatMessages) {
+                chatMessages.innerHTML = '';
+            }
+            
+            // 添加历史消息
+            result.messages.forEach(msg => {
+                const isUser = msg.role === 'user';
+                addMessageToChat(msg.content, isUser);
+            });
+            
+            // 滚动到底部
+            if (chatContainer) {
+                setTimeout(() => {
+                    const messagesContainer = chatContainer.querySelector('.chat-messages');
+                    if (messagesContainer) {
+                        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                    }
+                }, 100);
+            }
+            
+            console.log(`已加载 ${result.messages.length} 条历史消息`);
+        } else {
+            // 如果没有消息，隐藏聊天容器
+            if (chatContainer) {
+                chatContainer.style.display = 'none';
+            }
+        }
+    } catch (error) {
+        console.error('加载对话历史失败:', error);
+    }
+}
+
+// 加载对话列表
+async function loadConversations() {
+    try {
+        const response = await fetch('/api/conversations');
+        const result = await response.json();
+        
+        if (result.conversations) {
+            renderConversations(result.conversations);
+        }
+    } catch (error) {
+        console.error('加载对话列表失败:', error);
+    }
+}
+
+// 渲染对话列表（按日期分组）
+function renderConversations(conversations) {
+    if (!conversationsList) return;
+    
+    conversationsList.innerHTML = '';
+    
+    if (conversations.length === 0) {
+        conversationsList.innerHTML = '<div style="padding: 20px; text-align: center; color: #9ca3af; font-size: 14px;">暂无对话记录</div>';
+        return;
+    }
+    
+    // 按日期分组
+    const groups = {};
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const weekAgo = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const monthAgo = new Date(today.getTime() - 30 * 24 * 60 * 60 * 1000);
+    
+    conversations.forEach(conv => {
+        const updatedAt = new Date(conv.updated_at);
+        let groupKey = '';
+        let groupTitle = '';
+        
+        if (updatedAt >= today) {
+            groupKey = 'today';
+            groupTitle = '今天';
+        } else if (updatedAt >= weekAgo) {
+            groupKey = 'week';
+            groupTitle = '7天内';
+        } else if (updatedAt >= monthAgo) {
+            groupKey = 'month';
+            groupTitle = '30天内';
+        } else {
+            const year = updatedAt.getFullYear();
+            const month = updatedAt.getMonth() + 1;
+            groupKey = `${year}-${month}`;
+            groupTitle = `${year}-${String(month).padStart(2, '0')}`;
+        }
+        
+        if (!groups[groupKey]) {
+            groups[groupKey] = {
+                title: groupTitle,
+                conversations: []
+            };
+        }
+        groups[groupKey].conversations.push(conv);
+    });
+    
+    // 渲染分组
+    const groupOrder = ['today', 'week', 'month'];
+    Object.keys(groups).sort((a, b) => {
+        if (groupOrder.includes(a) && groupOrder.includes(b)) {
+            return groupOrder.indexOf(a) - groupOrder.indexOf(b);
+        }
+        if (groupOrder.includes(a)) return -1;
+        if (groupOrder.includes(b)) return 1;
+        return b.localeCompare(a); // 日期字符串倒序
+    }).forEach(groupKey => {
+        const group = groups[groupKey];
+        const groupDiv = document.createElement('div');
+        groupDiv.className = 'conversation-group';
+        
+        const titleDiv = document.createElement('div');
+        titleDiv.className = 'conversation-group-title';
+        titleDiv.textContent = group.title;
+        groupDiv.appendChild(titleDiv);
+        
+        group.conversations.forEach(conv => {
+            const item = document.createElement('div');
+            item.className = 'conversation-item';
+            if (conv.id === currentConversationId) {
+                item.classList.add('active');
+            }
+            
+            const content = document.createElement('div');
+            content.className = 'conversation-item-content';
+            content.textContent = conv.title || '新对话';
+            content.title = conv.title || '新对话';
+            
+            const actions = document.createElement('div');
+            actions.className = 'conversation-item-actions';
+            
+            const deleteBtn = document.createElement('button');
+            deleteBtn.className = 'conversation-delete-btn';
+            deleteBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>';
+            deleteBtn.title = '删除对话';
+            deleteBtn.onclick = (e) => {
+                e.stopPropagation();
+                deleteConversation(conv.id);
+            };
+            
+            actions.appendChild(deleteBtn);
+            
+            item.appendChild(content);
+            item.appendChild(actions);
+            
+            item.onclick = () => {
+                switchConversation(conv.id);
+            };
+            
+            groupDiv.appendChild(item);
+        });
+        
+        conversationsList.appendChild(groupDiv);
+    });
+}
+
+// 切换对话
+async function switchConversation(conversationId) {
+    currentConversationId = conversationId;
+    await loadChatHistory(conversationId);
+    await loadConversations(); // 刷新列表以更新active状态
+}
+
+// 创建新对话
+async function createNewConversation() {
+    try {
+        const response = await fetch('/api/conversations', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
+        
+        const result = await response.json();
+        
+        if (result.conversation_id) {
+            currentConversationId = result.conversation_id;
+            // 清空聊天记录
+            if (chatMessages) {
+                chatMessages.innerHTML = '';
+            }
+            if (chatContainer) {
+                chatContainer.style.display = 'none';
+            }
+            // 刷新对话列表
+            await loadConversations();
+        }
+    } catch (error) {
+        console.error('创建新对话失败:', error);
+    }
+}
+
+// 删除对话
+async function deleteConversation(conversationId) {
+    if (!confirm('确定要删除这个对话吗？')) {
+        return;
+    }
+    
+    try {
+        const response = await fetch(`/api/conversations/${conversationId}`, {
+            method: 'DELETE'
+        });
+        
+        const result = await response.json();
+        
+        if (result.status === 'success') {
+            // 如果删除的是当前对话，清空显示
+            if (conversationId === currentConversationId) {
+                currentConversationId = null;
+                if (chatMessages) {
+                    chatMessages.innerHTML = '';
+                }
+                if (chatContainer) {
+                    chatContainer.style.display = 'none';
+                }
+            }
+            // 刷新对话列表
+            await loadConversations();
+        }
+    } catch (error) {
+        console.error('删除对话失败:', error);
+        alert('删除失败，请稍后重试');
+    }
+}
+
+// 初始化侧边栏
+function initSidebar() {
+    sidebar = document.getElementById('sidebar');
+    conversationsList = document.getElementById('conversationsList');
+    const sidebarToggle = document.getElementById('sidebarToggle');
+    const sidebarExpandBtn = document.getElementById('sidebarExpandBtn');
+    const newConversationBtn = document.getElementById('newConversationBtn');
+    
+    // 更新侧边栏状态显示
+    function updateSidebarState() {
+        if (sidebar && sidebarExpandBtn) {
+            const isCollapsed = sidebar.classList.contains('collapsed');
+            sidebarExpandBtn.style.display = isCollapsed ? 'flex' : 'none';
+        }
+    }
+    
+    if (sidebarToggle) {
+        sidebarToggle.addEventListener('click', () => {
+            if (sidebar) {
+                sidebar.classList.toggle('collapsed');
+                updateSidebarState();
+            }
+        });
+    }
+    
+    if (sidebarExpandBtn) {
+        sidebarExpandBtn.addEventListener('click', () => {
+            if (sidebar) {
+                sidebar.classList.remove('collapsed');
+                updateSidebarState();
+            }
+        });
+    }
+    
+    if (newConversationBtn) {
+        newConversationBtn.addEventListener('click', createNewConversation);
+    }
+    
+    // 初始化状态
+    updateSidebarState();
+}
 
 

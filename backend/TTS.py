@@ -13,7 +13,8 @@ import torch
 import wave
 import io
 from queue import Queue, Empty
-from threading import Thread
+from threading import Thread, Lock
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------- 淡入淡出 ----------
 def fade_in_out(audio: np.ndarray, sr: int, fade_duration: float = 0.01) -> np.ndarray:
@@ -28,7 +29,9 @@ def fade_in_out(audio: np.ndarray, sr: int, fade_duration: float = 0.01) -> np.n
     return audio
 
 # ----------  CosyVoice  ----------
-COSYVOICE_ROOT = r"F:\Github\CosyVoice"
+# 获取当前文件所在目录（backend目录）
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+COSYVOICE_ROOT = os.path.join(BASE_DIR, "Cosy")
 MATCHA_TTS_PATH = os.path.join(COSYVOICE_ROOT, "third_party", "Matcha-TTS")
 for p in [COSYVOICE_ROOT, MATCHA_TTS_PATH]:
     if p not in sys.path:
@@ -41,13 +44,17 @@ for p in [COSYVOICE_ROOT, MATCHA_TTS_PATH]:
 
 
 class CosyvoiceRealTimeTTS:
-    def __init__(self, model_path: str, reference_audio_path: str = None, max_queue: int = 10):
+    # 类级别的预编译正则表达式，避免重复编译
+    _sentence_pattern = re.compile(r'[^。！？!?；;]*[。！？!?；;]?')
+    _word_pattern = re.compile(r'\w', flags=re.UNICODE)
+    
+    def __init__(self, model_path: str, reference_audio_path: str = None, max_queue: int = 10, load_jit: bool = False):
         # 延迟导入 CosyVoice2
         from cosyvoice.cli.cosyvoice import CosyVoice2
         from cosyvoice.utils.file_utils import load_wav
         
-        print("加载模型中...")
-        self.cosyvoice = CosyVoice2(model_path, load_jit=False, load_trt=False, fp16=True)
+        print(f"加载模型中... (JIT: {'启用' if load_jit else '禁用'})")
+        self.cosyvoice = CosyVoice2(model_path, load_jit=load_jit, load_trt=False, fp16=True)
         self.load_wav_func = load_wav
         self.sample_rate = self.cosyvoice.sample_rate
         self.ref_wav = None
@@ -59,6 +66,7 @@ class CosyvoiceRealTimeTTS:
         # ---- 音色缓存 ----
         self._prompt_semantic = None
         self._spk_emb = None
+        self._cache_lock = Lock()  # 音色缓存锁
         # ------------------
 
         self.sample_text = "这是一段测试语音，喂喂喂，你们听得到吗？让我看看啊别急"
@@ -76,23 +84,26 @@ class CosyvoiceRealTimeTTS:
         text = text.strip()
         if not text:
             return []
-        MAX_CHARS = 80
-        parts = re.split(r'([。！？]\s*)', text)
-        segs, buf = [], ""
-        for p in parts:
-            if not p.strip():
-                continue
-            if len(buf) + len(p) > MAX_CHARS and buf:
-                segs.append(buf.strip())
-                buf = ""
-            buf += p
-            while len(buf) > MAX_CHARS:
-                segs.append(buf[:MAX_CHARS])
-                buf = buf[MAX_CHARS:]
-        if buf.strip():
-            segs.append(buf.strip())
-        # 过滤纯标点/空白
-        segs = [s for s in segs if re.search(r'\w', s, flags=re.UNICODE)]
+        MAX_CHARS = 120  # 从80增加到120，减少切分段数
+        # 先按句末标点优先切分，保留标点（使用预编译的正则表达式）
+        raw_sentences = self._sentence_pattern.findall(text)
+        sentences = []
+        for sentence in raw_sentences:
+            cleaned = sentence.strip()
+            if cleaned:
+                sentences.append(cleaned)
+        if not sentences:
+            sentences = [text]
+        segs = []
+        for sentence in sentences:
+            current = sentence
+            while len(current) > MAX_CHARS:
+                segs.append(current[:MAX_CHARS].strip())
+                current = current[MAX_CHARS:]
+            if current.strip():
+                segs.append(current.strip())
+        # 过滤纯标点/空白（使用预编译的正则表达式）
+        segs = [s for s in segs if self._word_pattern.search(s)]
         return segs
 
     # ------------ 播放线程 ------------
@@ -147,7 +158,7 @@ class CosyvoiceRealTimeTTS:
     def _synthesis_worker(self, segments, use_clone):
         for idx, seg in enumerate(segments, 1):
             print(f"【合成】{idx}/{len(segments)}：{seg[:30]}...")
-            if not re.search(r'\w', seg, flags=re.UNICODE):
+            if not self._word_pattern.search(seg):
                 print(f"【跳过】段 {idx} 无有效文字")
                 continue
 
@@ -179,7 +190,7 @@ class CosyvoiceRealTimeTTS:
                 audio = fade_in_out(audio, self.sample_rate, self.fade_dur)
                 stereo = np.stack([audio, audio], axis=-1)
 
-                # 4）入队 + 回收
+                # 4）入队
                 dur = len(stereo) / self.sample_rate
                 self.total_audio_dur += dur
                 print(f"【合成】片段 {idx} 完成，时长 {dur:.2f}s")
@@ -192,9 +203,12 @@ class CosyvoiceRealTimeTTS:
             finally:
                 if results is not None:
                     del results
-                gc.collect()
-                torch.cuda.empty_cache()
+                # 注意：不在每个片段生成后立即清理显存，减少清理频率
+                # 显存清理将在所有片段生成完成后统一进行
 
+        # 所有片段生成完成后，统一清理显存
+        gc.collect()
+        torch.cuda.empty_cache()
         self.audio_queue.put(None)   # 结束哨兵
 
     # ------------ 对外接口 ------------
@@ -246,10 +260,61 @@ class CosyvoiceRealTimeTTS:
             except Empty:
                 break
 
-    # ------------ 生成音频数据（不播放）------------
-    def generate_audio(self, text: str, use_clone=True):
+    # ------------ 单个音频段生成（用于并行处理）------------
+    def _generate_single_segment(self, idx: int, seg: str, use_clone: bool):
+        """
+        生成单个文本段的音频
+        返回: (idx, audio) 或 (idx, None) 如果失败
+        """
+        if not self._word_pattern.search(seg):
+            print(f"【跳过】段 {idx} 无有效文字")
+            return (idx, None)
+        
+        print(f"【合成】{idx}：{seg[:30]}...")
+        results = None
+        try:
+            # 1）生成 - 需要加锁保护音色缓存访问
+            with self._cache_lock:
+                if use_clone and self._prompt_semantic is not None:
+                    results = self.cosyvoice.inference(
+                        seg, prompt_semantic=self._prompt_semantic,
+                        spk_emb=self._spk_emb, stream=False)
+                else:
+                    results = self.cosyvoice.inference_zero_shot(
+                        seg, self.sample_text, self.ref_wav, stream=False)
+                
+                # ✅ 关键：生成器→列表，防止二次next抛StopIteration
+                results = list(results)
+                
+                # 2）缓存音色（第一次，需要线程安全）
+                if use_clone and self._prompt_semantic is None:
+                    first = results[0]
+                    self._prompt_semantic = first.get("prompt_semantic")
+                    self._spk_emb = first.get("spk_emb")
+            
+            # 3）拿音频（在锁外处理，避免长时间持锁）
+            audio_result = results[0]
+            audio = audio_result['tts_speech'].squeeze().cpu().numpy().astype(np.float32)
+            if np.max(np.abs(audio)) > 0:
+                audio /= np.max(np.abs(audio))
+            audio = fade_in_out(audio, self.sample_rate, self.fade_dur)
+            
+            dur = len(audio) / self.sample_rate
+            print(f"【合成】片段 {idx} 完成，时长 {dur:.2f}s")
+            return (idx, audio)
+            
+        except Exception as e:
+            print(f"【合成】段 {idx} 失败：{repr(e)}")
+            return (idx, None)
+        finally:
+            if results is not None:
+                del results
+
+    # ------------ 生成音频数据（不播放，并行处理）------------
+    def generate_audio(self, text: str, use_clone=True, max_workers=None):
         """
         生成音频数据并返回为numpy数组（单声道）
+        使用并行处理加速生成，但保持输出顺序
         返回: (audio_data, sample_rate) 或 None
         """
         text = text.strip()
@@ -264,71 +329,146 @@ class CosyvoiceRealTimeTTS:
             if not segments:
                 print("[提示] 没有有效可合成文本")
                 return None
-            print(f"文本已切分为 {len(segments)} 段")
+            print(f"文本已切分为 {len(segments)} 段，开始并行生成...")
 
-            audio_segments = []
+            # 如果没有指定工作线程数，使用段数和CPU核心数的较小值
+            if max_workers is None:
+                import os
+                max_workers = min(len(segments), os.cpu_count() or 2, 4)  # 最多4个线程，避免显存溢出
             
-            for idx, seg in enumerate(segments, 1):
-                print(f"【合成】{idx}/{len(segments)}：{seg[:30]}...")
-                if not re.search(r'\w', seg, flags=re.UNICODE):
-                    print(f"【跳过】段 {idx} 无有效文字")
-                    continue
-
-                results = None
-                try:
-                    # 1）生成
-                    if use_clone and self._prompt_semantic is not None:
-                        results = self.cosyvoice.inference(
-                            seg, prompt_semantic=self._prompt_semantic,
-                            spk_emb=self._spk_emb, stream=False)
-                    else:
-                        results = self.cosyvoice.inference_zero_shot(
-                            seg, self.sample_text, self.ref_wav, stream=False)
-
-                    # ✅ 关键：生成器→列表，防止二次next抛StopIteration
-                    results = list(results)
-
-                    # 2）缓存音色（第一次）
-                    if use_clone and self._prompt_semantic is None:
-                        first = results[0]
-                        self._prompt_semantic = first.get("prompt_semantic")
-                        self._spk_emb = first.get("spk_emb")
-
-                    # 3）拿音频
-                    audio_result = results[0]
-                    audio = audio_result['tts_speech'].squeeze().cpu().numpy().astype(np.float32)
-                    if np.max(np.abs(audio)) > 0:
-                        audio /= np.max(np.abs(audio))
-                    audio = fade_in_out(audio, self.sample_rate, self.fade_dur)
-                    
-                    # 转换为单声道
-                    audio_segments.append(audio)
-                    
-                    dur = len(audio) / self.sample_rate
-                    print(f"【合成】片段 {idx} 完成，时长 {dur:.2f}s")
-
-                except Exception as e:
-                    print(f"【合成】段 {idx} 失败：{repr(e)}")
-                    continue
-
-                finally:
-                    if results is not None:
-                        del results
-                    gc.collect()
-                    torch.cuda.empty_cache()
-
-            if not audio_segments:
+            # 使用线程池并行处理
+            audio_results = {}  # 用字典存储结果，key为索引
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # 提交所有任务
+                future_to_idx = {
+                    executor.submit(self._generate_single_segment, idx, seg, use_clone): idx
+                    for idx, seg in enumerate(segments, 1)
+                }
+                
+                # 收集结果（按完成顺序，但用索引保持顺序）
+                for future in as_completed(future_to_idx):
+                    idx, audio = future.result()
+                    if audio is not None:
+                        audio_results[idx] = audio
+            
+            # 按索引顺序合并音频段（保证顺序）
+            if not audio_results:
                 print("[提示] 没有生成任何音频")
                 return None
-
+            
+            # 按索引排序后合并
+            sorted_indices = sorted(audio_results.keys())
+            audio_segments = [audio_results[idx] for idx in sorted_indices]
+            
             # 合并所有音频段
             full_audio = np.concatenate(audio_segments)
+            
+            # 最后统一清理显存（减少清理频率）
+            gc.collect()
+            torch.cuda.empty_cache()
+            
             print(f"✅ 音频生成完成，总时长 {len(full_audio) / self.sample_rate:.2f}s\n")
             return (full_audio, self.sample_rate)
             
         except Exception as e:
             print(f"❌ 生成错误：{e}")
+            import traceback
+            traceback.print_exc()
             return None
+
+    # ------------ 使用已保存的说话人生成音频（更快）------------
+    def generate_audio_with_speaker(self, text: str, spk_id: str, max_workers=None):
+        """
+        使用已保存的说话人生成音频数据
+        返回: (audio_data, sample_rate) 或 None
+        """
+        text = text.strip()
+        if not text:
+            print("[提示] 输入文本为空")
+            return None
+        
+        try:
+            segments = self.split_text_by_punctuation(text)
+            if not segments:
+                print("[提示] 没有有效可合成文本")
+                return None
+            print(f"使用说话人 {spk_id} 生成音频，文本已切分为 {len(segments)} 段...")
+            
+            # 如果没有指定工作线程数，使用段数和CPU核心数的较小值
+            if max_workers is None:
+                import os
+                max_workers = min(len(segments), os.cpu_count() or 2, 4)
+            
+            # 使用线程池并行处理
+            audio_results = {}
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_idx = {
+                    executor.submit(self._generate_single_segment_with_speaker, idx, seg, spk_id): idx
+                    for idx, seg in enumerate(segments, 1)
+                }
+                
+                for future in as_completed(future_to_idx):
+                    idx, audio = future.result()
+                    if audio is not None:
+                        audio_results[idx] = audio
+            
+            if not audio_results:
+                print("[提示] 没有生成任何音频")
+                return None
+            
+            sorted_indices = sorted(audio_results.keys())
+            audio_segments = [audio_results[idx] for idx in sorted_indices]
+            full_audio = np.concatenate(audio_segments)
+            
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+            print(f"✅ 音频生成完成，总时长 {len(full_audio) / self.sample_rate:.2f}s\n")
+            return (full_audio, self.sample_rate)
+            
+        except Exception as e:
+            print(f"❌ 生成错误：{e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    # ------------ 使用说话人生成单个音频段 ------------
+    def _generate_single_segment_with_speaker(self, idx: int, seg: str, spk_id: str):
+        """
+        使用已保存的说话人生成单个文本段的音频
+        返回: (idx, audio) 或 (idx, None) 如果失败
+        """
+        if not self._word_pattern.search(seg):
+            print(f"【跳过】段 {idx} 无有效文字")
+            return (idx, None)
+        
+        print(f"【合成】{idx}：{seg[:30]}...")
+        results = None
+        try:
+            # 使用已保存的说话人（通过zero_shot_spk_id参数）
+            results = self.cosyvoice.inference_zero_shot(
+                seg, '', None, zero_shot_spk_id=spk_id, stream=False)
+            
+            results = list(results)
+            
+            audio_result = results[0]
+            audio = audio_result['tts_speech'].squeeze().cpu().numpy().astype(np.float32)
+            if np.max(np.abs(audio)) > 0:
+                audio /= np.max(np.abs(audio))
+            audio = fade_in_out(audio, self.sample_rate, self.fade_dur)
+            
+            dur = len(audio) / self.sample_rate
+            print(f"【合成】片段 {idx} 完成，时长 {dur:.2f}s")
+            return (idx, audio)
+            
+        except Exception as e:
+            print(f"【合成】段 {idx} 失败：{repr(e)}")
+            return (idx, None)
+        finally:
+            if results is not None:
+                del results
 
     # ------------ 将numpy音频转换为WAV字节流 ------------
     def audio_to_wav_bytes(self, audio_data: np.ndarray, sample_rate: int):
@@ -360,8 +500,9 @@ class CosyvoiceRealTimeTTS:
 
 # -------------------- CLI --------------------
 if __name__ == "__main__":
-    MODEL_PATH = r"Model\CosyVoice2-0.5B"
-    REF_AUDIO = r"audio\zjj.wav"
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    MODEL_PATH = os.path.join(BASE_DIR, "Model", "CosyVoice2-0.5B")
+    REF_AUDIO = os.path.join(BASE_DIR, "audio", "zjj.wav")
 
     try:
         tts = CosyvoiceRealTimeTTS(MODEL_PATH, REF_AUDIO)

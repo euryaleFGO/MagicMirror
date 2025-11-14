@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>个人中心 - MagicMirror</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/auth.css') }}">
+</head>
+<body>
+    <div class="auth-container">
+        <div class="auth-header">
+            <h1 class="auth-title">个人中心</h1>
+            <p class="auth-subtitle">管理您的账户信息</p>
+        </div>
+        
+        <div class="personal-info">
+            <div class="current-username">当前用户名: {{ username }}</div>
+            <p style="color: #6b7280; font-size: 14px; margin-top: 5px;">您可以更新您的用户名和密码</p>
+        </div>
+        
+        <form class="auth-form personal-form" method="POST">
+            <div class="form-group">
+                <label class="form-label" for="new_username">新用户名</label>
+                <input 
+                    type="text" 
+                    id="new_username"
+                    name="new_username" 
+                    class="form-input" 
+                    placeholder="输入新用户名（可选）"
+                    minlength="3"
+                    maxlength="20"
+                    pattern="[a-zA-Z0-9_]+"
+                    title="用户名只能包含字母、数字和下划线，长度3-20位"
+                >
+            </div>
+            
+            <div class="form-group">
+                <label class="form-label" for="new_password">新密码</label>
+                <input 
+                    type="password" 
+                    id="new_password"
+                    name="new_password" 
+                    class="form-input" 
+                    placeholder="输入新密码（可选）"
+                    minlength="6"
+                    maxlength="50"
+                >
+            </div>
+            
+            <button type="submit" class="form-button">
+                更新信息
+            </button>
+        </form>
+        
+        <!-- 说话人管理区域 -->
+        <div class="speaker-management">
+            <div class="speaker-header">
+                <h2 class="speaker-title">说话人管理</h2>
+                <p class="speaker-subtitle">克隆和管理您的语音说话人（最多3个）</p>
+            </div>
+            
+            <!-- 添加说话人表单 -->
+            <div class="add-speaker-section">
+                <button class="add-speaker-btn" id="showAddSpeakerBtn">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="12" y1="5" x2="12" y2="19"></line>
+                        <line x1="5" y1="12" x2="19" y2="12"></line>
+                    </svg>
+                    <span>添加说话人</span>
+                </button>
+                
+                <div class="add-speaker-form" id="addSpeakerForm" style="display: none;">
+                    <h3>克隆新说话人</h3>
+                    <form id="speakerForm" enctype="multipart/form-data">
+                        <div class="form-group">
+                            <label class="form-label" for="speaker_name">说话人名称</label>
+                            <input 
+                                type="text" 
+                                id="speaker_name"
+                                name="name" 
+                                class="form-input" 
+                                placeholder="例如：我的声音"
+                                required
+                                maxlength="50"
+                            >
+                        </div>
+                        
+                        <div class="form-group">
+                            <label class="form-label" for="prompt_text">提示文本</label>
+                            <textarea 
+                                id="prompt_text"
+                                name="prompt_text" 
+                                class="form-input" 
+                                placeholder="请输入参考音频对应的文本内容（例如：希望你以后能够做的比我还好呦。）"
+                                rows="3"
+                                required
+                            ></textarea>
+                            <small style="color: #6b7280; font-size: 12px; margin-top: 4px; display: block;">
+                                提示：这是参考音频中说的内容，用于音色克隆
+                            </small>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label class="form-label" for="audio_file">参考音频文件</label>
+                            <input 
+                                type="file" 
+                                id="audio_file"
+                                name="audio" 
+                                class="form-input" 
+                                accept="audio/*"
+                                required
+                            >
+                            <small style="color: #6b7280; font-size: 12px; margin-top: 4px; display: block;">
+                                支持 WAV、MP3 等音频格式，建议时长3-10秒
+                            </small>
+                        </div>
+                        
+                        <div class="form-actions">
+                            <button type="submit" class="form-button" id="submitSpeakerBtn">
+                                开始克隆
+                            </button>
+                            <button type="button" class="form-button secondary" id="cancelAddSpeakerBtn">
+                                取消
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+            
+            <!-- 说话人列表 -->
+            <div class="speakers-list" id="speakersList">
+                <div class="loading" id="speakersLoading">加载中...</div>
+            </div>
+        </div>
+        
+        <div class="personal-actions">
+            <a href="{{ url_for('chat') }}" class="form-button secondary">返回聊天</a>
+            <a href="{{ url_for('logout') }}" class="form-button" style="background: #ef4444;">安全登出</a>
+        </div>
+        
+        <!-- 消息提示区域 -->
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                <div class="messages">
+                    <ul class="message-list">
+                        {% for category, message in messages %}
+                            <li class="message-item {{ category }}">{{ message }}</li>
+                        {% endfor %}
+                    </ul>
+                </div>
+            {% endif %}
+        {% endwith %}
+    </div>
+    
+    <script src="{{ url_for('static', filename='js/auth.js') }}"></script>
+</body>
+</html>

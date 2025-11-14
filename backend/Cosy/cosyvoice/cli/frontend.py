@@ -47,13 +47,16 @@ class CosyVoiceFrontEnd:
                  allowed_special: str = 'all'):
         self.tokenizer = get_tokenizer()
         self.feat_extractor = feat_extractor
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # 缓存设备状态，避免重复检查 torch.cuda.is_available()
+        self._is_cuda_available = torch.cuda.is_available()
+        self.device = torch.device('cuda' if self._is_cuda_available else 'cpu')
         option = onnxruntime.SessionOptions()
         option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
         option.intra_op_num_threads = 1
         self.campplus_session = onnxruntime.InferenceSession(campplus_model, sess_options=option, providers=["CPUExecutionProvider"])
+        # 使用缓存的设备状态
         self.speech_tokenizer_session = onnxruntime.InferenceSession(speech_tokenizer_model, sess_options=option,
-                                                                     providers=["CUDAExecutionProvider" if torch.cuda.is_available() else
+                                                                     providers=["CUDAExecutionProvider" if self._is_cuda_available else
                                                                                 "CPUExecutionProvider"])
         if os.path.exists(spk2info):
             self.spk2info = torch.load(spk2info, map_location=self.device)
@@ -71,6 +74,10 @@ class CosyVoiceFrontEnd:
             self.zh_tn_model = ZhNormalizer(remove_erhua=False)
             self.en_tn_model = EnNormalizer()
             self.inflect_parser = inflect.engine()
+        
+        # 缓存常用的 Resample 对象，避免重复创建
+        # CosyVoice2 通常使用 24000 采样率
+        self._resample_cache = {}
 
     def _extract_text_token(self, text):
         if isinstance(text, Generator):
@@ -158,7 +165,11 @@ class CosyVoiceFrontEnd:
         tts_text_token, tts_text_token_len = self._extract_text_token(tts_text)
         if zero_shot_spk_id == '':
             prompt_text_token, prompt_text_token_len = self._extract_text_token(prompt_text)
-            prompt_speech_resample = torchaudio.transforms.Resample(orig_freq=16000, new_freq=resample_rate)(prompt_speech_16k)
+            # 使用缓存的 Resample 对象，避免重复创建
+            resample_key = (16000, resample_rate)
+            if resample_key not in self._resample_cache:
+                self._resample_cache[resample_key] = torchaudio.transforms.Resample(orig_freq=16000, new_freq=resample_rate)
+            prompt_speech_resample = self._resample_cache[resample_key](prompt_speech_16k)
             speech_feat, speech_feat_len = self._extract_speech_feat(prompt_speech_resample)
             speech_token, speech_token_len = self._extract_speech_token(prompt_speech_16k)
             if resample_rate == 24000:
@@ -204,7 +215,11 @@ class CosyVoiceFrontEnd:
 
     def frontend_vc(self, source_speech_16k, prompt_speech_16k, resample_rate):
         prompt_speech_token, prompt_speech_token_len = self._extract_speech_token(prompt_speech_16k)
-        prompt_speech_resample = torchaudio.transforms.Resample(orig_freq=16000, new_freq=resample_rate)(prompt_speech_16k)
+        # 使用缓存的 Resample 对象，避免重复创建
+        resample_key = (16000, resample_rate)
+        if resample_key not in self._resample_cache:
+            self._resample_cache[resample_key] = torchaudio.transforms.Resample(orig_freq=16000, new_freq=resample_rate)
+        prompt_speech_resample = self._resample_cache[resample_key](prompt_speech_16k)
         prompt_speech_feat, prompt_speech_feat_len = self._extract_speech_feat(prompt_speech_resample)
         embedding = self._extract_spk_embedding(prompt_speech_16k)
         source_speech_token, source_speech_token_len = self._extract_speech_token(source_speech_16k)

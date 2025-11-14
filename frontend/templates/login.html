@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>用户登录 - MagicMirror</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/auth.css') }}">
+</head>
+<body>
+    <div class="auth-container">
+        <div class="auth-header">
+            <h1 class="auth-title">欢迎回来</h1>
+            <p class="auth-subtitle">登录您的账户，继续智能对话</p>
+        </div>
+        
+        <form class="auth-form" method="POST">
+            <div class="form-group">
+                <label class="form-label" for="username">用户名</label>
+                <input 
+                    type="text" 
+                    id="username"
+                    name="username" 
+                    class="form-input" 
+                    placeholder="请输入用户名"
+                    required 
+                    autofocus
+                    autocomplete="username"
+                >
+            </div>
+            
+            <div class="form-group">
+                <label class="form-label" for="password">密码</label>
+                <input 
+                    type="password" 
+                    id="password"
+                    name="password" 
+                    class="form-input" 
+                    placeholder="请输入密码"
+                    required 
+                    autocomplete="current-password"
+                >
+            </div>
+            
+            <button type="submit" class="form-button">
+                立即登录
+            </button>
+        </form>
+        
+        <div class="auth-links">
+            <p>还没有账户？<a href="{{ url_for('register') }}" class="auth-link">立即注册</a></p>
+        </div>
+        
+        <!-- 消息提示区域 -->
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                <div class="messages">
+                    <ul class="message-list">
+                        {% for category, message in messages %}
+                            <li class="message-item {{ category }}">{{ message }}</li>
+                        {% endfor %}
+                    </ul>
+                </div>
+            {% endif %}
+        {% endwith %}
+    </div>
+    
+    <script src="{{ url_for('static', filename='js/auth.js') }}"></script>
+</body>
+</html>

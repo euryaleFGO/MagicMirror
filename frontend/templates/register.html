@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>用户注册 - MagicMirror</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/auth.css') }}">
+</head>
+<body>
+    <div class="auth-container">
+        <div class="auth-header">
+            <h1 class="auth-title">创建账户</h1>
+            <p class="auth-subtitle">加入我们，开始您的智能对话之旅</p>
+        </div>
+        
+        <form class="auth-form" method="POST">
+            <div class="form-group">
+                <label class="form-label" for="username">用户名</label>
+                <input 
+                    type="text" 
+                    id="username"
+                    name="username" 
+                    class="form-input" 
+                    placeholder="请输入用户名"
+                    required 
+                    minlength="3"
+                    maxlength="20"
+                    pattern="[a-zA-Z0-9_]+"
+                    title="用户名只能包含字母、数字和下划线，长度3-20位"
+                >
+            </div>
+            
+            <div class="form-group">
+                <label class="form-label" for="password">密码</label>
+                <input 
+                    type="password" 
+                    id="password"
+                    name="password" 
+                    class="form-input" 
+                    placeholder="请输入密码"
+                    required 
+                    minlength="6"
+                    maxlength="50"
+                >
+            </div>
+            
+            <button type="submit" class="form-button">
+                立即注册
+            </button>
+        </form>
+        
+        <div class="auth-links">
+            <p>已有账户？<a href="{{ url_for('login') }}" class="auth-link">立即登录</a></p>
+        </div>
+        
+        <!-- 消息提示区域 -->
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                <div class="messages">
+                    <ul class="message-list">
+                        {% for category, message in messages %}
+                            <li class="message-item {{ category }}">{{ message }}</li>
+                        {% endfor %}
+                    </ul>
+                </div>
+            {% endif %}
+        {% endwith %}
+    </div>
+    
+    <script src="{{ url_for('static', filename='js/auth.js') }}"></script>
+</body>
+</html>

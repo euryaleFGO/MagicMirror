@@ -16,9 +16,10 @@ Thumbs.db
 .ruff_cache/
 
 # 模型与音频大文件
-Model/**
-!Model/.gitkeep
-audio/**/*.wav
+backend/Model/**
+!backend/Model/.gitkeep
+backend/audio/**/*.wav
+*.wav
 
 # 运行时生成文件
 *.log
