@@ -29,6 +29,27 @@ try:
     use_ttsfrd = True
 except ImportError:
     print("failed to import ttsfrd, use wetext instead")
+    # 添加 monkey patch 以避免 wetext 重复下载模型
+    import modelscope
+    _original_snapshot_download = modelscope.snapshot_download
+    def _patched_snapshot_download(model_id, **kwargs):
+        # 对于 wetext 模型，如果缓存已存在，直接返回缓存路径，避免网络请求
+        if model_id == 'pengzhendong/wetext':
+            default_cache_dir = os.path.expanduser('~/.cache/modelscope')
+            cache_dir = kwargs.get('cache_dir') or default_cache_dir
+            # 实际的模型缓存路径是 cache_dir/hub/model_id
+            model_cache_path = os.path.join(cache_dir, 'hub', model_id)
+            if os.path.exists(model_cache_path) and os.path.isdir(model_cache_path):
+                # 检查是否有实际的模型文件（至少有一个 .fst 文件）
+                import glob
+                fst_files = glob.glob(os.path.join(model_cache_path, '**/*.fst'), recursive=True)
+                if fst_files:
+                    # 直接返回缓存路径，完全跳过网络请求
+                    return model_cache_path
+        # 对于其他模型，使用原始方法
+        return _original_snapshot_download(model_id, **kwargs)
+    modelscope.snapshot_download = _patched_snapshot_download
+    
     from wetext import Normalizer as ZhNormalizer
     from wetext import Normalizer as EnNormalizer
     use_ttsfrd = False
@@ -47,17 +68,34 @@ class CosyVoiceFrontEnd:
                  allowed_special: str = 'all'):
         self.tokenizer = get_tokenizer()
         self.feat_extractor = feat_extractor
-        # 缓存设备状态，避免重复检查 torch.cuda.is_available()
-        self._is_cuda_available = torch.cuda.is_available()
-        self.device = torch.device('cuda' if self._is_cuda_available else 'cpu')
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         option = onnxruntime.SessionOptions()
         option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
         option.intra_op_num_threads = 1
-        self.campplus_session = onnxruntime.InferenceSession(campplus_model, sess_options=option, providers=["CPUExecutionProvider"])
-        # 使用缓存的设备状态
-        self.speech_tokenizer_session = onnxruntime.InferenceSession(speech_tokenizer_model, sess_options=option,
-                                                                     providers=["CUDAExecutionProvider" if self._is_cuda_available else
-                                                                                "CPUExecutionProvider"])
+        option.inter_op_num_threads = 1
+        # 禁用日志以减少开销
+        option.log_severity_level = 3  # 3 = ERROR, 减少日志输出
+        
+        # CPU 提供程序配置
+        cpu_providers = ["CPUExecutionProvider"]
+        self.campplus_session = onnxruntime.InferenceSession(campplus_model, sess_options=option, providers=cpu_providers)
+        
+        # CUDA 提供程序配置（优化性能）
+        if torch.cuda.is_available():
+            cuda_provider_options = {
+                'device_id': 0,
+                'arena_extend_strategy': 'kNextPowerOfTwo',
+                'gpu_mem_limit': 4 * 1024 * 1024 * 1024,  # 4GB
+                'cudnn_conv_algo_search': 'EXHAUSTIVE',
+                'do_copy_in_default_stream': True,  # 在默认流中执行拷贝，减少同步开销
+                'tunable_op_enable': True,  # 启用可调操作
+                'tunable_op_tuning_enable': True,  # 启用调优
+            }
+            providers = [("CUDAExecutionProvider", cuda_provider_options), "CPUExecutionProvider"]
+        else:
+            providers = ["CPUExecutionProvider"]
+        
+        self.speech_tokenizer_session = onnxruntime.InferenceSession(speech_tokenizer_model, sess_options=option, providers=providers)
         if os.path.exists(spk2info):
             self.spk2info = torch.load(spk2info, map_location=self.device)
         else:
@@ -74,10 +112,6 @@ class CosyVoiceFrontEnd:
             self.zh_tn_model = ZhNormalizer(remove_erhua=False)
             self.en_tn_model = EnNormalizer()
             self.inflect_parser = inflect.engine()
-        
-        # 缓存常用的 Resample 对象，避免重复创建
-        # CosyVoice2 通常使用 24000 采样率
-        self._resample_cache = {}
 
     def _extract_text_token(self, text):
         if isinstance(text, Generator):
@@ -165,11 +199,7 @@ class CosyVoiceFrontEnd:
         tts_text_token, tts_text_token_len = self._extract_text_token(tts_text)
         if zero_shot_spk_id == '':
             prompt_text_token, prompt_text_token_len = self._extract_text_token(prompt_text)
-            # 使用缓存的 Resample 对象，避免重复创建
-            resample_key = (16000, resample_rate)
-            if resample_key not in self._resample_cache:
-                self._resample_cache[resample_key] = torchaudio.transforms.Resample(orig_freq=16000, new_freq=resample_rate)
-            prompt_speech_resample = self._resample_cache[resample_key](prompt_speech_16k)
+            prompt_speech_resample = torchaudio.transforms.Resample(orig_freq=16000, new_freq=resample_rate)(prompt_speech_16k)
             speech_feat, speech_feat_len = self._extract_speech_feat(prompt_speech_resample)
             speech_token, speech_token_len = self._extract_speech_token(prompt_speech_16k)
             if resample_rate == 24000:
@@ -215,11 +245,7 @@ class CosyVoiceFrontEnd:
 
     def frontend_vc(self, source_speech_16k, prompt_speech_16k, resample_rate):
         prompt_speech_token, prompt_speech_token_len = self._extract_speech_token(prompt_speech_16k)
-        # 使用缓存的 Resample 对象，避免重复创建
-        resample_key = (16000, resample_rate)
-        if resample_key not in self._resample_cache:
-            self._resample_cache[resample_key] = torchaudio.transforms.Resample(orig_freq=16000, new_freq=resample_rate)
-        prompt_speech_resample = self._resample_cache[resample_key](prompt_speech_16k)
+        prompt_speech_resample = torchaudio.transforms.Resample(orig_freq=16000, new_freq=resample_rate)(prompt_speech_16k)
         prompt_speech_feat, prompt_speech_feat_len = self._extract_speech_feat(prompt_speech_resample)
         embedding = self._extract_spk_embedding(prompt_speech_16k)
         source_speech_token, source_speech_token_len = self._extract_speech_token(source_speech_16k)

@@ -8,7 +8,7 @@ import re
 import time
 import gc
 import numpy as np
-import sounddevice as sd
+# import sounddevice as sd  # 已注释：改为保存音频文件而不是播放
 import torch
 import wave
 import io
@@ -52,7 +52,7 @@ class CosyvoiceRealTimeTTS:
         # 延迟导入 CosyVoice2
         from cosyvoice.cli.cosyvoice import CosyVoice2
         from cosyvoice.utils.file_utils import load_wav
-        
+
         print(f"加载模型中... (JIT: {'启用' if load_jit else '禁用'})")
         self.cosyvoice = CosyVoice2(model_path, load_jit=load_jit, load_trt=False, fp16=True)
         self.load_wav_func = load_wav
@@ -60,10 +60,13 @@ class CosyvoiceRealTimeTTS:
         self.ref_wav = None
         if reference_audio_path and os.path.isfile(reference_audio_path):
             self.ref_wav = self.load_wav_func(reference_audio_path, 16000)
+            print(f"[INFO] 已加载参考音频：{reference_audio_path}")
         else:
             print(f"[WARN] 参考音频不存在：{reference_audio_path}")
 
         # ---- 音色缓存 ----
+        # 注意：音色缓存将在第一次生成音频时自动提取（延迟初始化）
+        # 这样允许用户先上传参考音频，再创建说话人
         self._prompt_semantic = None
         self._spk_emb = None
         self._cache_lock = Lock()  # 音色缓存锁
@@ -106,50 +109,71 @@ class CosyvoiceRealTimeTTS:
         segs = [s for s in segs if self._word_pattern.search(s)]
         return segs
 
-    # ------------ 播放线程 ------------
-    def _playback_worker(self):
+    # ------------ 播放线程（已注释：改为保存音频文件）------------
+    # def _playback_worker(self):
+    #     while self.is_playing or not self.audio_queue.empty():
+    #         try:
+    #             data = self.audio_queue.get(timeout=1)
+    #             if data is None:
+    #                 self.audio_queue.task_done()  # ✅ 关键修复
+    #                 break
+    #             self.played_dur += len(data) / self.sample_rate
+    #             if not (self.stream and self.stream.active):
+    #                 self._init_stream()
+    #             self.stream.write(data)
+    #             self.audio_queue.task_done()  # ✅ 正常任务完成
+    #         except Empty:
+    #             continue
+    #         except Exception as e:
+    #             print(f"[播放] 非致命错误：{e}")
+    #             time.sleep(0.1)
+    #     self._close_stream()
+    
+    def _save_audio_worker(self, output_file: str):
+        """保存音频工作线程：从队列中获取音频数据并保存到文件"""
+        audio_chunks = []
         while self.is_playing or not self.audio_queue.empty():
             try:
                 data = self.audio_queue.get(timeout=1)
                 if data is None:
-                    self.audio_queue.task_done()  # ✅ 关键修复
+                    self.audio_queue.task_done()
                     break
+                # 如果是立体声，转换为单声道
+                if len(data.shape) > 1 and data.shape[-1] == 2:
+                    data = np.mean(data, axis=-1)
+                elif len(data.shape) > 1 and data.shape[0] == 2:
+                    data = np.mean(data, axis=0)
+                audio_chunks.append(data)
                 self.played_dur += len(data) / self.sample_rate
-                if not (self.stream and self.stream.active):
-                    self._init_stream()
-                self.stream.write(data)
-                self.audio_queue.task_done()  # ✅ 正常任务完成
+                self.audio_queue.task_done()
             except Empty:
                 continue
             except Exception as e:
-                print(f"[播放] 非致命错误：{e}")
-                time.sleep(0.1)
+                print(f"[保存音频] 错误：{e}")
+                self.audio_queue.task_done()
+        
+        # 合并所有音频块并保存
+        if audio_chunks:
+            full_audio = np.concatenate(audio_chunks)
+            self.audio_to_wav_file(full_audio, self.sample_rate, output_file)
+            print(f"[保存音频] 已保存到: {output_file}")
+        
         self._close_stream()
 
-    # ------------ 音频流 ------------
-    def _init_stream(self):
-        if self.stream:
-            self.stream.close()
-        self.stream = sd.OutputStream(
-            samplerate=self.sample_rate,
-            channels=2,
-            dtype=np.float32,
-            blocksize=128
-        )
-        self.stream.start()
+    # ------------ 音频流（已注释：改为保存音频文件）------------
+    # def _init_stream(self):
+    #     if self.stream:
+    #         self.stream.close()
+    #     self.stream = sd.OutputStream(
+    #         samplerate=self.sample_rate,
+    #         channels=2,
+    #         dtype=np.float32,
+    #         blocksize=128
+    #     )
+    #     self.stream.start()
 
     def _close_stream(self):
-        if self.stream:
-            try:
-                if self.stream.active:
-                    remain = max(0.0, self.total_audio_dur - self.played_dur + 0.5)
-                    time.sleep(remain)
-                    self.stream.stop()
-                self.stream.close()
-            except Exception as e:
-                print(f"[音频] 关闭流错误：{e}")
-            finally:
-                self.stream = None
+        """关闭流（兼容性函数，现在不做任何操作）"""
         self.is_playing = False
         self.total_audio_dur = 0.0
         self.played_dur = 0.0
@@ -188,13 +212,14 @@ class CosyvoiceRealTimeTTS:
                 if np.max(np.abs(audio)) > 0:
                     audio /= np.max(np.abs(audio))
                 audio = fade_in_out(audio, self.sample_rate, self.fade_dur)
-                stereo = np.stack([audio, audio], axis=-1)
+                # 不再转换为立体声，直接保存单声道
+                # stereo = np.stack([audio, audio], axis=-1)
 
-                # 4）入队
-                dur = len(stereo) / self.sample_rate
+                # 4）入队（单声道）
+                dur = len(audio) / self.sample_rate
                 self.total_audio_dur += dur
                 print(f"【合成】片段 {idx} 完成，时长 {dur:.2f}s")
-                self.audio_queue.put(stereo, block=True)
+                self.audio_queue.put(audio, block=True)
 
             except Exception as e:
                 print(f"【合成】段 {idx} 失败：{repr(e)}")
@@ -211,8 +236,15 @@ class CosyvoiceRealTimeTTS:
         torch.cuda.empty_cache()
         self.audio_queue.put(None)   # 结束哨兵
 
-    # ------------ 对外接口 ------------
-    def text_to_speech(self, text: str, use_clone=True):
+    # ------------ 对外接口（已修改：改为保存音频文件）------------
+    def text_to_speech(self, text: str, use_clone=True, output_file: str = None):
+        """
+        文本转语音并保存为文件（不再播放）
+        Args:
+            text: 要合成的文本
+            use_clone: 是否使用零样本克隆
+            output_file: 输出文件路径，如果为None则使用默认路径
+        """
         text = text.strip()
         if not text:
             print("[提示] 输入文本为空")
@@ -220,6 +252,13 @@ class CosyvoiceRealTimeTTS:
         if use_clone and self.ref_wav is None:
             print("[WARN] 无参考语音，自动使用默认音色")
             use_clone = False
+        
+        # 如果没有指定输出文件，使用默认路径
+        if output_file is None:
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file = os.path.join(BASE_DIR, "audio", f"tts_output_{timestamp}.wav")
+        
         try:
             segments = self.split_text_by_punctuation(text)
             if not segments:
@@ -227,10 +266,12 @@ class CosyvoiceRealTimeTTS:
                 return False
             print(f"文本已切分为 {len(segments)} 段")
 
-            # 清空队列 & 启动播放线程
+            # 清空队列 & 启动保存音频线程
             self._clear_queue()
             self.is_playing = True
-            self.playback_thread = Thread(target=self._playback_worker, daemon=True)
+            self.total_audio_dur = 0.0
+            self.played_dur = 0.0
+            self.playback_thread = Thread(target=self._save_audio_worker, args=(output_file,), daemon=True)
             self.playback_thread.start()
 
             # 启动合成线程
@@ -238,13 +279,13 @@ class CosyvoiceRealTimeTTS:
                                 args=(segments, use_clone), daemon=True)
             synth_thread.start()
 
-            # 阻塞至播放完
+            # 阻塞至保存完成
             self.audio_queue.join()
             synth_thread.join()
             self.is_playing = False
             if self.playback_thread:
                 self.playback_thread.join(timeout=5)
-            print("✅ 合成与播放完成\n")
+            print(f"✅ 合成与保存完成，文件: {output_file}\n")
             return True
         except Exception as e:
             print(f"❌ 合成错误：{e}")
@@ -496,6 +537,39 @@ class CosyvoiceRealTimeTTS:
         
         wav_buffer.seek(0)
         return wav_buffer.read()
+    
+    def audio_to_wav_file(self, audio_data: np.ndarray, sample_rate: int, output_file: str):
+        """
+        将numpy音频数组保存为WAV文件
+        """
+        # 确保输出目录存在
+        output_dir = os.path.dirname(output_file)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+        
+        # 确保音频是单声道
+        if len(audio_data.shape) > 1:
+            if audio_data.shape[0] == 2:
+                audio_data = np.mean(audio_data, axis=0)
+            elif len(audio_data.shape) > 1 and audio_data.shape[-1] == 2:
+                audio_data = np.mean(audio_data, axis=-1)
+            else:
+                audio_data = audio_data.squeeze()
+        
+        # 归一化到 [-1, 1]
+        max_val = np.max(np.abs(audio_data))
+        if max_val > 0:
+            audio_data = audio_data / max_val
+        
+        # 转换为16位整数
+        audio_int16 = (audio_data * 32767).astype(np.int16)
+        
+        # 保存为WAV文件
+        with wave.open(output_file, 'wb') as wav_file:
+            wav_file.setnchannels(1)  # 单声道
+            wav_file.setsampwidth(2)  # 16位 = 2字节
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(audio_int16.tobytes())
 
 
 # -------------------- CLI --------------------

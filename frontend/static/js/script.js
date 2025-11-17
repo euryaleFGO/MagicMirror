@@ -709,8 +709,8 @@ async function sendToAI(query) {
             currentText = result.response;
             displayText = '';
             
-            // 清理思考动画，保留占位气泡
-            clearThinkingMessage({ preserve: true });
+            // 不在这里清除思考动画，保留到音频真正开始播放时再清除
+            // 这样加载动画会一直显示，直到音频开始播放
             
             // 发送TTS请求
             await textToSpeech(result.response);
@@ -733,6 +733,7 @@ async function sendToAI(query) {
 // 文本转语音（流式字幕）
 async function textToSpeech(text) {
     try {
+        // 加载动画会一直显示，直到音频开始播放
         const response = await fetch('/api/tts', {
             method: 'POST',
             headers: {
@@ -787,6 +788,17 @@ async function textToSpeech(text) {
             
             audioPlayer = new Audio(audioUrl);
             
+            // 关键优化：音频真正开始播放时才清除加载动画
+            let animationCleared = false;
+            audioPlayer.onplay = () => {
+                if (!animationCleared) {
+                    // 音频真正开始播放时，清除思考动画，保留占位气泡
+                    clearThinkingMessage({ preserve: true });
+                    animationCleared = true;
+                    console.log('音频开始播放，清除加载动画');
+                }
+            };
+            
             // 播放完成时清理
             audioPlayer.onended = async () => {
                 URL.revokeObjectURL(audioUrl);
@@ -796,6 +808,11 @@ async function textToSpeech(text) {
             // 播放错误处理
             audioPlayer.onerror = async (error) => {
                 console.error('音频播放失败:', error);
+                // 播放失败时也要清除加载动画
+                if (!animationCleared) {
+                    clearThinkingMessage({ preserve: true });
+                    animationCleared = true;
+                }
                 URL.revokeObjectURL(audioUrl);
                 await finishSpeaking();
             };
@@ -803,17 +820,26 @@ async function textToSpeech(text) {
             // 开始播放
             audioPlayer.play().catch(async (error) => {
                 console.error('播放音频失败:', error);
+                // 播放失败时也要清除加载动画
+                if (!animationCleared) {
+                    clearThinkingMessage({ preserve: true });
+                    animationCleared = true;
+                }
                 URL.revokeObjectURL(audioUrl);
                 await finishSpeaking();
             });
         } else {
             console.error('TTS返回数据格式错误:', result);
+            // TTS 失败时清除加载动画
+            clearThinkingMessage({ preserve: true });
             updateBotMessage(text);
             setState(STATE.IDLE);
             updateSubtitle('您今天想聊什么？');
         }
     } catch (error) {
         console.error('TTS失败:', error);
+        // TTS 失败时清除加载动画
+        clearThinkingMessage({ preserve: true });
         updateBotMessage(text);
         setState(STATE.IDLE);
         updateSubtitle('您今天想聊什么？');

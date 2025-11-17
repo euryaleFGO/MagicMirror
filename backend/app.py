@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify, redirect, url_for, flash, session
+from flask import Flask, render_template, request, jsonify, redirect, url_for, flash, session, send_from_directory
 from flask_cors import CORS
 import os
 import sys
@@ -6,10 +6,12 @@ import json
 import base64
 import io
 import threading
+import requests
 from vosk import Model, KaldiRecognizer
 import pyaudio
 from openai_infer import APIInfer
-from TTS import CosyvoiceRealTimeTTS
+# 延迟导入 TTS，避免在 Flask 启动时崩溃
+# from TTS import CosyvoiceRealTimeTTS
 from config import (DEEPSEEK_API_KEY, BASE_URL, MODEL, 
                     MYSQL_HOST, MYSQL_PORT, MYSQL_USER, 
                     MYSQL_PASSWORD, MYSQL_DATABASE, MYSQL_CHARSET)
@@ -20,10 +22,18 @@ from werkzeug.security import generate_password_hash, check_password_hash
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FRONTEND_DIR = os.path.join(os.path.dirname(BASE_DIR), 'frontend')
 
+# 设置 modelscope 缓存目录，避免重复下载
+os.environ.setdefault('MODELSCOPE_CACHE', os.path.expanduser('~/.cache/modelscope'))
+
 # 添加CosyVoice路径到sys.path（用于导入cosyvoice模块）
 COSYVOICE_ROOT = os.path.join(BASE_DIR, "Cosy")
-if COSYVOICE_ROOT not in sys.path:
-    sys.path.append(COSYVOICE_ROOT)
+MATCHA_TTS_PATH = os.path.join(COSYVOICE_ROOT, "third_party", "Matcha-TTS")
+for p in [COSYVOICE_ROOT, MATCHA_TTS_PATH]:
+    if p not in sys.path:
+        sys.path.append(p)
+
+# 不预初始化 wetext，避免在 Flask 启动时出现 segfault
+# wetext 将在 TTS 模块首次使用时自动初始化
 
 app = Flask(__name__, 
             template_folder=os.path.join(FRONTEND_DIR, 'templates'),
@@ -72,28 +82,93 @@ def init_api_infer():
     except Exception as e:
         print(f"AI对话模块初始化失败：{e}")
 
-# 初始化TTS
+# 初始化TTS（延迟初始化，避免在 Flask 启动时崩溃）
 def init_tts():
     global tts_engine
-    model_path = os.path.join(BASE_DIR, "Model", "CosyVoice2-0.5B")
-    ref_audio = os.path.join(BASE_DIR, "audio", "zjj.wav")
-    try:
-        if os.path.exists(model_path):
+    # 不在启动时初始化，改为延迟初始化（首次使用时初始化）
+    print("TTS模块将延迟初始化（首次使用时自动初始化）")
+    tts_engine = None
+
+# TTS 初始化状态（使用锁保护，避免多线程竞争）
+_tts_init_lock = threading.Lock()
+_tts_init_error = None
+
+# 延迟初始化 TTS（首次使用时在主线程中调用）
+# 注意：必须在主线程中初始化，kaldifst/wetext 不支持在非主线程中初始化
+def ensure_tts_initialized():
+    global tts_engine, _tts_init_error
+    
+    if tts_engine is not None:
+        return True
+    
+    # 开始初始化（使用锁保护，确保只初始化一次）
+    with _tts_init_lock:
+        # 双重检查
+        if tts_engine is not None:
+            return True
+        
+        # 延迟导入，避免在 Flask 启动时导入导致崩溃
+        try:
+            from TTS import CosyvoiceRealTimeTTS
+        except Exception as e:
+            print(f"[ERROR] 导入 TTS 模块失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        
+        model_path = os.path.join(BASE_DIR, "Model", "CosyVoice2-0.5B")
+        ref_audio = os.path.join(BASE_DIR, "audio", "zjj.wav")
+        
+        if not os.path.exists(model_path):
+            print(f"[ERROR] TTS模型路径不存在：{model_path}")
+            return False
+        
+        if not os.path.exists(ref_audio):
+            print(f"[ERROR] 参考音频文件不存在: {ref_audio}")
+            return False
+        
+        print(f"[INFO] 正在初始化 TTS（延迟初始化，在主线程中）...")
+        print(f"[INFO] 使用默认参考音频: {ref_audio}")
+        print(f"[INFO] 模型路径: {model_path}")
+        
+        # 在主线程中直接初始化 TTS（不在后台线程中，避免 kaldifst segfault）
+        # kaldifst/wetext 不支持在非主线程中初始化
+        print("[INFO] 在主线程中初始化 TTS...")
+        try:
+            import sys
+            sys.stdout.flush()
+            
+            # 确保路径正确
+            current_dir = os.getcwd()
+            if BASE_DIR not in sys.path:
+                sys.path.insert(0, BASE_DIR)
+            
             tts_engine = CosyvoiceRealTimeTTS(model_path, ref_audio, load_jit=False)
+            print("[INFO] TTS模块初始化成功")
+            sys.stdout.flush()
+            
             # 加载已保存的说话人信息（如果存在）
             spk2info_path = os.path.join(model_path, "spk2info.pt")
             if os.path.exists(spk2info_path):
                 try:
                     import torch
-                    tts_engine.cosyvoice.frontend.spk2info = torch.load(spk2info_path, map_location=tts_engine.cosyvoice.frontend.device)
-                    print(f"已加载 {len(tts_engine.cosyvoice.frontend.spk2info)} 个说话人")
+                    tts_engine.cosyvoice.frontend.spk2info = torch.load(
+                        spk2info_path, 
+                        map_location=tts_engine.cosyvoice.frontend.device
+                    )
+                    print(f"[INFO] 已加载 {len(tts_engine.cosyvoice.frontend.spk2info)} 个说话人")
                 except Exception as e:
-                    print(f"加载说话人信息失败：{e}")
-            print("TTS模块初始化成功")
-        else:
-            print(f"警告：TTS模型路径不存在：{model_path}")
-    except Exception as e:
-        print(f"TTS模块初始化失败：{e}")
+                    print(f"[WARN] 加载说话人信息失败：{e}")
+            
+            print("[INFO] TTS 初始化完成")
+            return True
+        except Exception as e:
+            _tts_init_error = str(e)
+            print(f"[ERROR] TTS 初始化失败: {e}")
+            import traceback
+            traceback.print_exc()
+            tts_engine = None
+            return False
 
 def get_db_connection():
     """获取MySQL数据库连接"""
@@ -480,14 +555,9 @@ def api_chat():
 
 @app.route('/api/tts', methods=['POST'])
 def text_to_speech():
-    """文本转语音接口 - 生成音频并返回给前端"""
-    global tts_engine
-    
+    """文本转语音接口 - 调用独立的 TTS 服务"""
     if 'user_id' not in session:
         return jsonify({'error': '未登录'}), 401
-    
-    if not tts_engine:
-        return jsonify({'error': 'TTS模块未初始化'}), 500
     
     try:
         data = request.json
@@ -511,37 +581,52 @@ def text_to_speech():
         cursor.close()
         conn.close()
         
-        # 如果用户有选中的说话人，使用保存的说话人（更快）
+        # 调用独立的 TTS 服务
+        import requests
+        tts_service_url = "http://localhost:5001/tts/generate"
+        
+        payload = {
+            'text': text,
+            'use_clone': True
+        }
+        
+        # 如果用户有选中的说话人，传递 spk_id
         if speaker:
-            spk_id = speaker['spk_id']
-            # 使用保存的说话人进行合成（通过zero_shot_spk_id参数）
-            result = tts_engine.generate_audio_with_speaker(text, spk_id)
-        else:
-            # 使用零样本克隆（较慢）
-            result = tts_engine.generate_audio(text, use_clone=True)
+            payload['spk_id'] = speaker['spk_id']
+            payload['use_clone'] = False
         
-        if result is None:
-            return jsonify({'error': '音频生成失败'}), 500
-        
-        audio_data, sample_rate = result
-        
-        # 转换为WAV字节流
-        wav_bytes = tts_engine.audio_to_wav_bytes(audio_data, sample_rate)
-        
-        # 将WAV字节流编码为base64
-        audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
-        
-        return jsonify({
-            'status': 'success',
-            'audio': audio_b64,  # base64编码的WAV音频数据
-            'format': 'wav',
-            'sample_rate': sample_rate
-        })
+        try:
+            response = requests.post(tts_service_url, json=payload, timeout=60)
+            if response.status_code == 200:
+                result = response.json()
+                return jsonify(result)
+            else:
+                error_msg = response.json().get('error', 'TTS服务错误')
+                return jsonify({'error': f'TTS服务错误: {error_msg}'}), response.status_code
+        except requests.exceptions.ConnectionError:
+            return jsonify({'error': 'TTS服务未启动，请先启动 TTS 服务'}), 503
+        except requests.exceptions.Timeout:
+            return jsonify({'error': 'TTS服务请求超时'}), 504
+        except Exception as e:
+            return jsonify({'error': f'调用TTS服务失败: {str(e)}'}), 500
         
     except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
+@app.route('/audio/<filename>')
+def serve_audio(filename):
+    """提供音频文件访问，前端可以通过这个URL播放音频"""
+    try:
+        audio_dir = os.path.join(BASE_DIR, "audio")
+        # 安全检查：只允许访问 audio 目录下的文件
+        if not os.path.exists(os.path.join(audio_dir, filename)):
+            return jsonify({'error': '文件不存在'}), 404
+        return send_from_directory(audio_dir, filename, mimetype='audio/wav')
+    except Exception as e:
+        print(f"提供音频文件失败: {e}")
+        return jsonify({'error': '文件访问失败'}), 500
 
 @app.route('/api/clear_history', methods=['POST'])
 def clear_history():
@@ -826,20 +911,53 @@ def add_speaker():
             # 生成唯一的spk_id
             spk_id = f"user_{user_id}_spk_{uuid.uuid4().hex[:8]}"
             
-            # 使用零样本克隆添加说话人
-            global tts_engine
-            if not tts_engine:
-                return jsonify({'error': 'TTS模块未初始化'}), 500
+            # 调用 TTS 服务添加说话人
+            tts_service_url = "http://localhost:5001/tts/add_speaker"
             
-            # 添加说话人到模型
-            success = tts_engine.cosyvoice.add_zero_shot_spk(
-                prompt_text=prompt_text,
-                prompt_speech_16k=prompt_speech_16k,
-                zero_shot_spk_id=spk_id
-            )
-            
-            if not success:
-                return jsonify({'error': '添加说话人失败'}), 500
+            try:
+                # 发送音频文件和提示文本到 TTS 服务
+                with open(temp_path, 'rb') as f:
+                    files = {'audio': (audio_file.filename, f, 'audio/wav')}
+                    data = {
+                        'prompt_text': prompt_text,
+                        'spk_id': spk_id  # 传递预生成的 spk_id
+                    }
+                    response = requests.post(tts_service_url, files=files, data=data, timeout=60)
+                
+                if response.status_code != 200:
+                    error_msg = response.json().get('error', 'TTS服务错误')
+                    cursor.close()
+                    conn.close()
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                    return jsonify({'error': f'TTS服务错误: {error_msg}'}), response.status_code
+                
+                result = response.json()
+                returned_spk_id = result.get('spk_id')
+                
+                if not returned_spk_id:
+                    cursor.close()
+                    conn.close()
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                    return jsonify({'error': '添加说话人失败：未返回说话人ID'}), 500
+                
+                # 使用返回的 spk_id（如果 TTS 服务生成了新的）
+                if returned_spk_id != spk_id:
+                    spk_id = returned_spk_id
+                    
+            except requests.exceptions.ConnectionError:
+                cursor.close()
+                conn.close()
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                return jsonify({'error': 'TTS服务未启动，请先启动 TTS 服务'}), 503
+            except Exception as e:
+                cursor.close()
+                conn.close()
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                return jsonify({'error': f'调用TTS服务失败: {str(e)}'}), 500
             
             # 保存说话人信息到数据库
             cursor.execute("""
@@ -858,9 +976,6 @@ def add_speaker():
                 cursor.execute("UPDATE speakers SET is_active=TRUE WHERE id=%s", (speaker_id,))
             
             conn.commit()
-            
-            # 保存spk2info到文件（持久化）
-            tts_engine.cosyvoice.save_spkinfo()
             
             cursor.close()
             conn.close()
@@ -968,12 +1083,17 @@ def delete_speaker(speaker_id):
         cursor.execute("DELETE FROM speakers WHERE id=%s", (speaker_id,))
         conn.commit()
         
-        # 从模型中删除说话人
-        global tts_engine
-        if tts_engine and hasattr(tts_engine.cosyvoice, 'frontend'):
-            if spk_id in tts_engine.cosyvoice.frontend.spk2info:
-                del tts_engine.cosyvoice.frontend.spk2info[spk_id]
-                tts_engine.cosyvoice.save_spkinfo()
+        # 调用 TTS 服务删除说话人
+        tts_service_url = "http://localhost:5001/tts/delete_speaker"
+        try:
+            response = requests.post(tts_service_url, json={'spk_id': spk_id}, timeout=10)
+            if response.status_code != 200:
+                error_msg = response.json().get('error', 'TTS服务错误')
+                print(f"TTS服务删除说话人失败: {error_msg}")
+        except requests.exceptions.ConnectionError:
+            print("警告：TTS服务未启动，无法从TTS引擎中删除说话人")
+        except Exception as e:
+            print(f"调用TTS服务删除说话人失败: {e}")
         
         cursor.close()
         conn.close()
@@ -988,7 +1108,9 @@ def init_all():
     init_db()
     init_vosk()
     init_api_infer()
-    init_tts()
+    # TTS 将在主线程中延迟初始化（不在后台线程中，避免 segfault）
+    print("TTS模块将在首次使用时在主线程中初始化")
+    init_tts()  # 这个函数现在只是设置 tts_engine = None
 
 if __name__ == '__main__':
     # 设置标准输出编码为UTF-8，避免中文乱码
@@ -999,12 +1121,10 @@ if __name__ == '__main__':
         except:
             pass
     
-    # 检查是否在reloader子进程中（避免重复初始化）
-    # WERKZEUG_RUN_MAIN在reloader子进程中为'true'，在主监控进程中为None
-    # 我们只在子进程中初始化一次
-    if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
-        print("正在初始化所有模块...")
-        init_all()
+    # 初始化所有模块（禁用 reloader 后，直接在主进程中初始化）
+    print("正在初始化所有模块...")
+    init_all()
     
     print("Flask应用启动中...")
-    app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)
+    # 禁用 reloader 以避免 kaldifst 在子进程中读取 FST 文件失败的问题
+    app.run(debug=True, host='0.0.0.0', port=5000, threaded=True, use_reloader=False)
